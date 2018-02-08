@@ -38,7 +38,7 @@
 #define kWAVEfmtChunkSize 24
 #define kWAVEdataChunkHeaderSize 8
 
-#define VERBOSE 0
+#define VERBOSE 1
 
 // Helper functions
 int32_t GetInputFormat(FILE * inputFile, AudioFormatDescription * theInputFormat, uint32_t * theFileType);
@@ -46,6 +46,7 @@ int32_t SetOutputFormat(AudioFormatDescription theInputFormat, AudioFormatDescri
 int32_t FindDataStart(FILE * inputFile, uint32_t inputFileType, int32_t * dataPos, int32_t * dataSize);
 int32_t EncodeALAC(FILE * inputFile, FILE * outputFile, AudioFormatDescription theInputFormat, AudioFormatDescription theOutputFormat, int32_t inputDataSize);
 int32_t DecodeALAC(FILE * inputFile, FILE * outputFile, AudioFormatDescription theInputFormat, AudioFormatDescription theOutputFormat, int32_t inputDataSize, uint32_t outputFileType);
+int32_t DecodeALACFromM4a(FILE * inputFile, FILE * outputFile, AudioFormatDescription theInputFormat, AudioFormatDescription theOutputFormat, int32_t inputDataSize, uint32_t outputFileType);
 void GetOutputFileType(char * outputFileName, uint32_t * outputFileType);
 ALACChannelLayoutTag GetALACChannelLayoutTag(uint32_t inChannelsPerFrame);
 
@@ -127,11 +128,31 @@ int32_t main (int32_t argc, char * argv[])
         theError = GetInputFormat(inputFile, &inputFormat, &inputFileType);
         if (theError)
         {
-            fprintf(stderr," Cannot determine what format file \"%s\" is\n", inputFileName);
-            exit (1);            
+            size_t fileNameLangth = strlen(inputFileName);
+
+            if (inputFileName[fileNameLangth - 4] == '.' && inputFileName[fileNameLangth - 3] == 'm' &&
+                    inputFileName[fileNameLangth - 2] == '4' && inputFileName[fileNameLangth - 1] == 'a')
+            {
+                fprintf(stdout, "The input file extension is m4a!\n");
+                inputFileType = 'm4a';
+                inputFormat.mFormatID = kALACFormatAppleLossless;
+                inputFormat.mChannelsPerFrame = 2;
+                inputFormat.mSampleRate = 44100;
+                inputFormat.mBitsPerChannel = 16;
+                inputFormat.mFormatFlags = kTestFormatFlag_16BitSourceData;
+                inputFormat.mBytesPerPacket = 0;
+                inputFormat.mFramesPerPacket = kALACDefaultFramesPerPacket;
+                inputFormat.mReserved = 0;
+                theError = 0;
+            }
+            else
+            {
+                fprintf(stderr," Cannot determine what format file \"%s\" is\n", inputFileName);
+                exit (1);
+            }
         }
         
-        if (inputFileType != 'WAVE' && inputFileType != 'caff')
+        if (inputFileType != 'WAVE' && inputFileType != 'caff' && inputFileType != 'm4a')
         {
             fprintf(stderr," File \"%s\" is of an unsupported type\n", outputFileName);
             exit (1);                        
@@ -170,7 +191,14 @@ int32_t main (int32_t argc, char * argv[])
                 fprintf(stderr," Cannot decode more than two channels to WAVE\n");
                 exit (1);            
             }
-            DecodeALAC(inputFile, outputFile, inputFormat, outputFormat, inputDataSize, outputFileType);
+            if (inputFileType == 'caff')
+            {
+                DecodeALAC(inputFile, outputFile, inputFormat, outputFormat, inputDataSize, outputFileType);
+            }
+            else
+            {
+                DecodeALACFromM4a(inputFile, outputFile, inputFormat, outputFormat, inputDataSize, outputFileType);
+            }
         }
 	}
 	
@@ -372,6 +400,11 @@ int32_t FindDataStart(FILE * inputFile, uint32_t inputFileType, int32_t * dataPo
             break;
         case 'caff':
             done = FindCAFFDataStart(inputFile, dataPos, dataSize);
+            break;
+        case 'm4a':
+            *dataPos = 32 + kALACMaxEscapeHeaderBytes;
+            *dataSize = 7449711;
+            done = true;
             break;
     }
     
@@ -586,6 +619,130 @@ int32_t EncodeALAC(FILE * inputFile, FILE * outputFile, AudioFormatDescription t
 }
 
 // There's not a whole lot of difference between encode and decode on this level
+int32_t DecodeALACFromM4a(FILE * inputFile, FILE * outputFile, AudioFormatDescription theInputFormat, AudioFormatDescription theOutputFormat, int32_t inputDataSize, uint32_t outputFileType)
+{
+    int32_t theInputPacketBytes = theInputFormat.mChannelsPerFrame * (theOutputFormat.mBitsPerChannel >> 3) * theInputFormat.mFramesPerPacket;
+    int32_t theOutputPacketBytes = theInputPacketBytes;
+    int32_t thePacketTableSize = 0, packetTablePos = 0, outputDataSizePos = 0, inputDataPos = 0;
+    uint8_t * theReadBuffer = (uint8_t *)calloc(theInputPacketBytes, 1);
+    uint8_t * theWriteBuffer = (uint8_t *)calloc(theOutputPacketBytes, 1);
+    int32_t numBytes = 0;
+    int64_t numDataBytes = 0;
+    uint32_t numFrames = 0;
+    BitBuffer theInputBuffer;
+    uint8_t * theMagicCookie = NULL;
+    uint32_t theMagicCookieSize = 0;
+
+    ALACDecoder * theDecoder = new ALACDecoder;
+
+    theMagicCookieSize = sizeof(ALACSpecificConfig);
+    theMagicCookie = (uint8_t *)calloc(theMagicCookieSize, 1);
+
+    ALACSpecificConfig *config = (ALACSpecificConfig *)theMagicCookie;
+
+    config->frameLength = theInputFormat.mFramesPerPacket;
+    config->compatibleVersion = 0;
+    config->bitDepth = 16;
+    config->pb = 40;
+    config->mb = 10;
+    config->kb = 14;
+    config->numChannels = theInputFormat.mChannelsPerFrame;
+    config->maxRun = 255;
+    config->maxFrameBytes = 0;
+    config->avgBitRate = 1411200;
+    config->sampleRate = 44100;
+    // While we don't have a use for this here, if you were using arbitrary channel layouts, you'd need to run the following check:
+
+    theDecoder->Init(theMagicCookie, theMagicCookieSize);
+    free(theMagicCookie);
+
+    BitBufferInit(&theInputBuffer, theReadBuffer, theInputPacketBytes);
+    inputDataPos = ftell(inputFile);
+
+    if (outputFileType != 'WAVE')
+    {
+        // we only write out the caff header, the 'desc' chunk and the 'data' chunk
+        // write out the caff header
+        WriteCAFFcaffChunk(outputFile);
+
+        // write out the desc chunk
+        WriteCAFFdescChunk(outputFile, theOutputFormat);
+
+        // We might be multi channel
+        if (theOutputFormat.mChannelsPerFrame > 2)
+        {
+            // we are not rearranging the output data
+            WriteCAFFchanChunk(outputFile, CAFFChannelLayoutTags[theOutputFormat.mChannelsPerFrame - 1]);
+        }
+
+        // We'll write out the data chunk next. The 'data' size will start past the 'data' chunk identifier
+        outputDataSizePos = ftell(outputFile) + sizeof(uint32_t);
+
+        // Finally, write out the data chunk
+        WriteCAFFdataChunk(outputFile);
+    }
+    else
+    {
+        // We're writing a mono or stereo WAVE file
+        WriteWAVERIFFChunk(outputFile);
+        WriteWAVEfmtChunk(outputFile, theOutputFormat);
+        WriteWAVEdataChunk(outputFile);
+        outputDataSizePos = ftell(outputFile) - sizeof(uint32_t);
+    }
+    int32_t numBytesRead = 0;
+
+    while (theInputPacketBytes > 0 && (numBytesRead = fread(theReadBuffer, 1, theInputPacketBytes, inputFile)) > 0)
+    {
+#if VERBOSE
+        printf ("Read %i bytes\n", numBytesRead);
+#endif
+        theDecoder->Decode(&theInputBuffer, theWriteBuffer, theInputFormat.mFramesPerPacket, theInputFormat.mChannelsPerFrame, &numFrames);
+        numBytes = numFrames * theOutputFormat.mBytesPerFrame;
+#if VERBOSE
+        printf ("Writing %i bytes\n", numBytes);
+#endif
+        fwrite(theWriteBuffer, 1, numBytes, outputFile);
+        numDataBytes += numBytes;
+#if VERBOSE
+        printf ("Number of Data %i bytes\n", numDataBytes);
+#endif
+        inputDataPos += numBytesRead;
+        BitBufferReset(&theInputBuffer);
+        if (numDataBytes >= 7449711)
+        {
+            printf ("Reach the data end, break!\n");
+            break;
+        }
+    }
+    if (outputFileType != 'WAVE')
+    {
+        // cleanup -- write out the data size
+        fseek(outputFile, outputDataSizePos, SEEK_SET);
+        numDataBytes += kCAFFdataChunkEditsSize; // add in the edit bytes
+#if VERBOSE
+        printf ("numDataBytes == %i bytes\n", numDataBytes);
+#endif
+        WriteCAFFChunkSize(outputFile, numDataBytes);
+    }
+    else
+    {
+        // cleanup -- write out the data size
+        fseek(outputFile, outputDataSizePos, SEEK_SET);
+        WriteWAVEChunkSize(outputFile, (uint32_t)numDataBytes);
+        // write out the file size
+        fseek(outputFile, 4, SEEK_SET);
+        WriteWAVEChunkSize(outputFile, numDataBytes + sizeof(outputFileType) + kWAVEdataChunkHeaderSize + kWAVEfmtChunkSize); // add in the size for 'WAVE', size of the data' chunk header and the 'fmt ' chunk
+    }
+
+    delete theDecoder;
+
+    free(theReadBuffer);
+    free(theWriteBuffer);
+
+    return 0;
+}
+
+// There's not a whole lot of difference between encode and decode on this level
 int32_t DecodeALAC(FILE * inputFile, FILE * outputFile, AudioFormatDescription theInputFormat, AudioFormatDescription theOutputFormat, int32_t inputDataSize, uint32_t outputFileType)
 {
     int32_t theInputPacketBytes = theInputFormat.mChannelsPerFrame * (theOutputFormat.mBitsPerChannel >> 3) * theInputFormat.mFramesPerPacket + kALACMaxEscapeHeaderBytes;
@@ -601,12 +758,11 @@ int32_t DecodeALAC(FILE * inputFile, FILE * outputFile, AudioFormatDescription t
     uint32_t theMagicCookieSize = 0;
     
     ALACDecoder * theDecoder = new ALACDecoder;
-    
+
     // We need to get the cookie from the file
     theMagicCookieSize = GetMagicCookieSizeFromCAFFkuki(inputFile);
     theMagicCookie = (uint8_t *)calloc(theMagicCookieSize, 1);
     GetMagicCookieFromCAFFkuki(inputFile, theMagicCookie, &theMagicCookieSize);
-    
     // While we don't have a use for this here, if you were using arbitrary channel layouts, you'd need to run the following check:
     
     theDecoder->Init(theMagicCookie, theMagicCookieSize);
